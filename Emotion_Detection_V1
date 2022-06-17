@@ -1,0 +1,664 @@
+import cv2
+import dlib
+import pickle
+import warnings
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import itertools 
+
+import urllib.request
+
+from sklearn import metrics
+from scipy.spatial import distance
+from sklearn.metrics import accuracy_score
+from matplotlib import pyplot as plt
+from tqdm import tqdm,tqdm_pandas
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+
+import re
+import keras
+
+from keras.models import Sequential
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.optimizers import Adam, SGD
+from keras.layers import Dense, Dropout, Activation, Flatten
+from keras.layers import Conv2D, MaxPooling2D, BatchNormalization
+from keras.losses import categorical_crossentropy
+from keras.regularizers import l2
+from keras.callbacks import EarlyStopping, ModelCheckpoint
+from keras.models import load_model
+
+# grab tools from our tensorflow and keras toolboxes!
+import tensorflow as tf
+from keras.models import Sequential
+from keras.layers import Activation, Dropout, Flatten, Dense
+from keras import optimizers
+
+warnings.filterwarnings("ignore")
+def model_to_string(model):
+    import re
+    stringlist = []
+    model.summary(print_fn=lambda x: stringlist.append(x))
+    sms = "\n".join(stringlist)
+    sms = re.sub('_\d\d\d','', sms)
+    sms = re.sub('_\d\d','', sms)
+    sms = re.sub('_\d','', sms)  
+    return sms
+
+###Getting the csv data loaded
+!wget -O ./ferdata.csv "https://storage.googleapis.com/inspirit-ai-data-bucket-1/Data/AI%20Scholars/Sessions%206%20-%2010%20(Projects)/Project%20-%20Emotion%20Detection/fer2013_5.csv"
+
+###Getting the Dlib Shape predictor!
+!wget -O ./shape_predictor_68_face_landmarks.dat "https://storage.googleapis.com/inspirit-ai-data-bucket-1/Data/AI%20Scholars/Sessions%206%20-%2010%20(Projects)/Project%20-%20Emotion%20Detection/shape_predictor_68_face_landmarks.dat"
+
+###Getting the Xpure loaded
+!wget -O ./pureX.npy "https://storage.googleapis.com/inspirit-ai-data-bucket-1/Data/AI%20Scholars/Sessions%206%20-%2010%20(Projects)/Project%20-%20Emotion%20Detection/pureX.npy"
+
+###Getting the Xdata loaded
+!wget -O ./dataX.npy "https://storage.googleapis.com/inspirit-ai-data-bucket-1/Data/AI%20Scholars/Sessions%206%20-%2010%20(Projects)/Project%20-%20Emotion%20Detection/dataX_edited.npy"
+
+###Getting the Ydata loaded
+!wget -O ./dataY.npy "https://storage.googleapis.com/inspirit-ai-data-bucket-1/Data/AI%20Scholars/Sessions%206%20-%2010%20(Projects)/Project%20-%20Emotion%20Detection/dataY.npy"
+
+print ("Data Downloaded!")
+
+'''
+Plots the confusion Matrix and saves it
+'''
+def plot_confusion_matrix(y_true,y_predicted):
+  cm = metrics.confusion_matrix(y_true, y_predicted)
+  print ("Plotting the Confusion Matrix")
+  labels = list(label_map.values())
+  df_cm = pd.DataFrame(cm,index = labels,columns = labels)
+  fig = plt.figure()
+  res = sns.heatmap(df_cm, annot=True,cmap='Blues', fmt='g')
+  plt.yticks([0.5,1.5,2.5,3.5,4.5], labels,va='center')
+  plt.title('Confusion Matrix - TestData')
+  plt.ylabel('True label')
+  plt.xlabel('Predicted label')
+ 
+  plt.show()
+  plt.close()
+
+def plot_graphs(history, best):
+  
+  plt.figure(figsize=[10,4])
+  # summarize history for accuracy
+  plt.subplot(121)
+  plt.plot(history.history['accuracy'])
+  plt.plot(history.history['val_accuracy'])
+  plt.title('model accuracy across training\n best accuracy of %.02f'%best[1])
+  plt.ylabel('accuracy')
+  plt.xlabel('epoch')
+  plt.legend(['train', 'test'], loc='upper left')
+  
+  # summarize history for loss
+  plt.subplot(122)
+  plt.plot(history.history['loss'])
+  plt.plot(history.history['val_loss'])
+  plt.title('model loss across training\n best loss of %.02f'%best[0])
+  plt.ylabel('loss')
+  plt.xlabel('epoch')
+  plt.legend(['train', 'test'], loc='upper left')
+  plt.show()
+
+#Integer to Label Mapping
+label_map = {"0":"ANGRY","1":"HAPPY","2":"SAD","3":"SURPRISE","4":"NEUTRAL"}
+
+
+#Load the 68 face Landmark file
+predictor = dlib.shape_predictor('./shape_predictor_68_face_landmarks.dat')
+"""
+Returns facial landmarks for the given input image path
+"""
+def get_landmarks(image):
+  
+  
+  #:type image : cv2 object
+  #:rtype landmarks : list of tuples where each tuple represents 
+  #                  the x and y co-ordinates of facial keypoints
+  
+  #Bounding Box co-ordinates around the face(Training data is 48*48(cropped faces))
+  rects = [dlib.rectangle(left=1, top=1, right=47, bottom=47)]
+
+  #Read Image using OpenCV
+  #image = cv2.imread(image_path)
+  #Detect the Faces within the image
+  landmarks = [(p.x, p.y) for p in predictor(image, rects[0]).parts()]
+  return image,landmarks
+
+"""
+Display image with its Facial Landmarks
+"""
+def image_landmarks(image,face_landmarks):
+  """
+  :type image_path : str
+  :type face_landmarks : list of tuples where each tuple represents 
+                     the x and y co-ordinates of facial keypoints
+  :rtype : None
+  """
+  radius = -4
+  circle_thickness = 1
+  image_copy = image.copy()
+  for (x, y) in face_landmarks:
+    cv2.circle(image_copy, (x, y), circle_thickness, (255,0,0), radius)
+    
+  plt.imshow(image_copy, interpolation='nearest')
+  plt.show()
+  
+"""
+Computes euclidean distance between 68 Landmark Points for our features
+e_dist is a list of features that will go into our model.
+Each feature is a distance between two landmark points, and every pair of points
+must have a feature.
+"""
+  
+def landmarks_edist(face_landmarks):
+    e_dist = []
+    for i,j  in itertools.combinations(range(68), 2):
+      e_dist.append(distance.euclidean(face_landmarks[i],face_landmarks[j]))
+    return e_dist
+  
+def compare_learning(mlp, lm, cnn, vgg): # there's one model missing: MLP from pixels
+  
+  # summarize history for accuracy
+  plt.plot(vgg.history['val_accuracy'],)
+  plt.plot(cnn.history['val_accuracy'])
+  plt.plot(mlp.history['val_accuracy'],)
+  plt.plot(lm.history['val_accuracy'])
+  plt.ylabel('validitation accuracy')
+  plt.xlabel('epoch')
+  plt.legend(['cnn_transfer', 'cnn_scratch', 'mlp_pixels', 'mlp_landmarks'], bbox_to_anchor=[1,1])
+  plt.xticks(range(0, epochs+1, 5), range(0, epochs+1, 5))
+  plt.show()
+
+#@title If the previous code cell fails to download the data properly, please run this.
+import cv2
+import dlib
+import pickle
+import warnings
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import urllib.request
+from sklearn import metrics
+from scipy.spatial import distance
+from matplotlib import pyplot as plt
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier 
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.model_selection import train_test_split
+import io
+
+###Getting the csv data loaded
+!wget -O ./ferdata.csv "https://storage.googleapis.com/inspirit-ai-data-bucket-1/Data/AI%20Scholars/Sessions%206%20-%2010%20(Projects)/Project%20-%20Emotion%20Detection/fer2013_5.csv"
+
+###Getting the Dlib Shape predictor!
+!wget -O ./shape_predictor_68_face_landmarks.dat "https://storage.googleapis.com/inspirit-ai-data-bucket-1/Data/AI%20Scholars/Sessions%206%20-%2010%20(Projects)/Project%20-%20Emotion%20Detection/shape_predictor_68_face_landmarks.dat"
+
+###Getting the Xpure loaded
+!wget -O ./pureX.npy "https://storage.googleapis.com/inspirit-ai-data-bucket-1/Data/AI%20Scholars/Sessions%206%20-%2010%20(Projects)/Project%20-%20Emotion%20Detection/pureX.npy"
+
+###Getting the Xdata loaded
+!wget -O ./dataX.npy "https://storage.googleapis.com/inspirit-ai-data-bucket-1/Data/AI%20Scholars/Sessions%206%20-%2010%20(Projects)/Project%20-%20Emotion%20Detection/dataX_edited.npy"
+
+###Getting the Ydata loaded
+!wget -O ./dataY.npy "https://storage.googleapis.com/inspirit-ai-data-bucket-1/Data/AI%20Scholars/Sessions%206%20-%2010%20(Projects)/Project%20-%20Emotion%20Detection/dataY.npy"
+
+print ("Data Downloaded!")
+
+
+
+# First, we initialize our model
+tmp_model = Sequential()
+
+# then we add a "Dense" (i.e. fully connected) layer
+tmp_model.add(Dense(____, input_shape=(5,), activation = 'relu')) # for the first layer we specify the input dimensions 
+
+# then we have to add another layer 
+tmp_model.add(Dense(____, activation = 'relu'))
+
+# we end by defining the output layer, which has the number of dimensions of the predictions we're making
+tmp_model.add(Dense(____, activation = 'softmax'))
+
+# we finalize the model by "compiling" it and defining some other hyperparameters 
+tmp_model.compile(loss='categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
+
+#@title Instructor Solution
+
+# First, we initialize our model
+tmp_model = Sequential()
+
+# then we add a "Dense" (i.e. fully connected) layer
+tmp_model.add(Dense(7, input_shape=(5,), activation = 'relu')) # for the first layer we specify the input dimensions 
+
+# then we have to add another layer 
+tmp_model.add(Dense(7, activation = 'relu'))
+
+# we end by defining the output layer, which has the number of dimensions of the predictions we're making
+tmp_model.add(Dense(4, activation = 'softmax'))
+
+# we finalize the model by "compiling" it and defining some other hyperparameters 
+tmp_model.compile(loss='categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
+
+#YOUR CODE HERE
+
+
+
+#@title Instructor Solution
+
+perceptron = Sequential()
+perceptron.add(Dense(units = 1024, input_shape = (2278,),kernel_initializer='glorot_normal',activation = 'relu'))
+perceptron.add(Dense(units = 512,kernel_initializer='glorot_normal' , activation = 'relu'))
+perceptron.add(Dense(units = 5, activation = 'softmax'))
+perceptron.compile(loss='categorical_crossentropy', optimizer=SGD(lr=0.001), metrics=['accuracy'])
+
+#@title Run this to test if your model is right! { display-mode: "form" }
+perceptron_answer = Sequential()
+perceptron_answer.add(Dense(units = 1024, input_shape = (2278,),kernel_initializer='glorot_normal',activation = 'relu'))
+perceptron_answer.add(Dense(units = 512,kernel_initializer='glorot_normal' , activation = 'relu'))
+perceptron_answer.add(Dense(units = 5, activation = 'softmax'))
+    
+perceptron_answer.compile(
+    loss='categorical_crossentropy',
+    optimizer=SGD(lr=0.001),
+    metrics=['accuracy'])
+
+if model_to_string(perceptron) == model_to_string(perceptron_answer):
+  print('Good job, you specified it correctly!')
+else: 
+  print('Please check your code again!')
+
+
+# the number of times we pass all the training data through the model 
+epochs = 20
+# the number of examples we pass to the model at each time
+batch_size = 64
+# the proportion of testing data we set aside (e.g. 10%)
+test_ratio = .1
+# the number of emotion categories we have to predict
+n_labels = 5
+
+"""###Load the original (unprocessed) data saved on Day 2!"""
+
+# load data 
+dataX_pixels = np.load('pureX.npy')
+dataY_labels = np.load('dataY.npy')
+
+"""### Convert labels to one-hot encoded labels
+
+One hot encoding is a representation of categorical variables as binary vectors
+"""
+
+# convert labels to one hot encoding
+y_onehot = to_categorical(dataY_labels, len(set(dataY_labels)))
+
+# what does this data type look like?
+
+"""<b>Discuss:</b> 
+* What does our `y_onehot` variable look like?
+* Is it clear how these are two equivalent ways to represent the target?
+
+###Split and Standardize your Data
+"""
+
+# split Data into Train, Test (90-10)
+X_train, X_test, y_train, y_test = train_test_split(dataX_pixels, y_onehot, test_size=test_ratio, random_state=42)
+
+#### Standardize the data ##########
+pixel_scaler = StandardScaler()
+pixel_scaler.fit(X_train)
+X_train = pixel_scaler.transform(X_train)
+X_test = pixel_scaler.transform(X_test)
+
+"""## Exercise: Build a simple MLP for emotion detection (call it `mlp_model`)
+
+"""
+
+#YOUR CODE HERE
+
+
+#END CODE
+
+#@title Instructor Solution
+
+mlp_model = Sequential()
+mlp_model.add(Dense(5120, activation='relu',kernel_initializer='glorot_normal', input_shape=( X_train.shape[1]   ,)))
+mlp_model.add(Dropout(0.5))
+mlp_model.add(Dense(512,kernel_initializer='glorot_normal', activation='relu'))
+mlp_model.add(Dropout(0.5))
+mlp_model.add(Dense(256,kernel_initializer='glorot_normal', activation='relu'))
+mlp_model.add(Dropout(0.5))
+mlp_model.add(Dense(n_labels, activation='softmax'))
+
+mlp_model.summary()
+
+# Compiling the model with SGD optimizer and categorical crossentropy loss
+mlp_model.compile(loss=categorical_crossentropy, optimizer=SGD(lr=0.001), metrics=['accuracy'])
+              
+#Saves the Best Model Based on Val Loss
+checkpoint = ModelCheckpoint('best_mlp_model.h5', verbose=1, monitor='val_accuracy', save_best_only=True,  mode='auto')  
+
+#training the model
+mlp_history = mlp_model.fit(X_train, y_train, batch_size=batch_size, epochs=epochs, verbose=1, 
+                            callbacks=[checkpoint], validation_data=(X_test, y_test), shuffle=True)
+
+"""##Neural Network Model Evaluation on pixel inputs
+
+###Evaluate best model
+"""
+
+mlp_performance = mlp_model.evaluate(X_test, y_test, batch_size=64)
+
+
+
+plot_graphs(mlp_history, mlp_performance);
+
+
+
+y_pred_mlp = mlp_model.predict(X_test)
+y_pred_mlp_classes = np.argmax(y_pred_mlp, axis=1)
+y_true = np.argmax(y_test,axis=1)
+plot_confusion_matrix(y_true, y_pred_mlp_classes)
+
+
+#Load the data (Distances between facial Landmarks)
+dataX_lm = np.load('./dataX.npy')
+
+# split Data into Train, Test (90-10)
+X_train_lm, X_test_lm, y_train_lm, y_test_lm = train_test_split(dataX_lm, y_onehot, test_size=0.1, random_state=42)
+
+#### Standardize the data #####
+lm_scaler = StandardScaler()
+lm_scaler.fit(X_train_lm)
+X_train_lm = lm_scaler.transform(X_train_lm)
+X_test_lm = lm_scaler.transform(X_test_lm)
+
+
+
+#YOUR CODE HERE
+
+#@title Instructor Solution
+lm_model = Sequential()
+lm_model.add(Dense(5120, activation='relu',kernel_initializer='glorot_normal', input_shape=( X_train_lm.shape[1]   ,)))
+lm_model.add(Dropout(0.2))
+lm_model.add(Dense(512,kernel_initializer='glorot_normal', activation='relu'))
+lm_model.add(Dropout(0.2))
+lm_model.add(Dense(256,kernel_initializer='glorot_normal', activation='relu'))
+lm_model.add(Dropout(0.2))
+lm_model.add(Dense(n_labels, activation='softmax'))
+
+# Compiling the model with SGD optimizer and categorical crossentropy loss
+lm_model.compile(loss=categorical_crossentropy, optimizer=SGD(lr=0.001), metrics=['accuracy'])
+
+#Saves the Best Model Based on Val Loss
+checkpoint = ModelCheckpoint('best_lm_model.h5', verbose=1, monitor='val_loss',save_best_only=True,  mode='auto')  
+#training the model
+lm_history = lm_model.fit(X_train_lm, y_train_lm, batch_size=batch_size, epochs=epochs, 
+                          verbose=1, callbacks=[checkpoint], validation_data=(X_test_lm, y_test_lm), shuffle=True)
+
+"""### Evaluate model"""
+
+# YOUR CODE HERE
+
+#@title Instructor Solution
+lm_performance = lm_model.evaluate(X_test_lm, y_test, batch_size=64)
+
+"""###Visualize accuracy and loss over training + display best model's performance"""
+
+# YOUR CODE HERE
+
+#@title Instructor Solution
+plot_graphs(lm_history, lm_performance)
+
+"""## Instructor-Led Discussion
+
+What are some differences between the our pixel input model and our distance input model?
+
+#Convolutional Neural Networks for Emotion Detection!
+
+###Model Hyperparameters
+"""
+
+# we'll use the same epochs and batch size as above
+width, height = 48, 48
+
+"""###Reshape the inputs"""
+
+# pixels were vectors
+print(X_train.shape)
+
+X_train_cnn = X_train.reshape(len(X_train),height,width)
+X_test_cnn = X_test.reshape(len(X_test),height,width)
+
+# we've converted them to images
+print(X_train_cnn.shape) 
+# now we add one more dimension for model compatibility
+print(X_test_cnn.shape)
+
+# now we add one more dimension for model compatibility
+X_train_cnn = np.expand_dims(X_train_cnn,3)
+X_test_cnn = np.expand_dims(X_test_cnn,3)
+
+print(X_train_cnn.shape)
+
+"""### Build our model
+Change the hyperparameters in the model below and feel free to add more layers!
+"""
+
+# initialize model
+cnn_model = Sequential()
+# this conv layer has 64 filters! the input shape needs to be the same dimensions of the image
+cnn_model.add(Conv2D(64, kernel_size=(3, 3), activation='relu', input_shape=(width, height, 1)))
+# batch normalization 
+cnn_model.add(BatchNormalization())
+# max pooling
+cnn_model.add(MaxPooling2D(pool_size=(2, 2), strides=(2, 2)))
+# dropout
+cnn_model.add(Dropout(0.5))
+
+
+# flatten all the outputs between convolutional and dense layers
+cnn_model.add(Flatten())
+# add a "dense layer" (i.e. the fully connected layers in MLPs) with dropout
+cnn_model.add(Dense(512, activation='relu'))
+# output layer
+cnn_model.add(Dense(n_labels, activation='softmax'))
+
+#@title Instructor Solution
+
+# pedagogically, it's probably a good idea to not use this model, but it's nice to have in case
+# comparing the basic model above with transfer learning more clearly motivates that approach
+
+cnn_model = Sequential()
+
+cnn_model.add(Conv2D(64, kernel_size=(3, 3), activation='relu', input_shape=(width, height, 1), kernel_regularizer=l2(0.01)))
+cnn_model.add(Conv2D(64, kernel_size=(3, 3), activation='relu', padding='same'))
+cnn_model.add(BatchNormalization())
+cnn_model.add(MaxPooling2D(pool_size=(2, 2), strides=(2, 2)))
+cnn_model.add(Dropout(0.5))
+
+cnn_model.add(Conv2D(128, kernel_size=(3, 3), activation='relu', padding='same'))
+cnn_model.add(BatchNormalization())
+cnn_model.add(Conv2D(128, kernel_size=(3, 3), activation='relu', padding='same'))
+cnn_model.add(BatchNormalization())
+cnn_model.add(MaxPooling2D(pool_size=(2, 2), strides=(2, 2)))
+cnn_model.add(Dropout(0.5))
+
+cnn_model.add(Conv2D(256, kernel_size=(3, 3), activation='relu', padding='same'))
+cnn_model.add(BatchNormalization())
+cnn_model.add(Conv2D(256, kernel_size=(3, 3), activation='relu', padding='same'))
+cnn_model.add(BatchNormalization())
+cnn_model.add(MaxPooling2D(pool_size=(2, 2), strides=(2, 2)))
+cnn_model.add(Dropout(0.5))
+
+cnn_model.add(Conv2D(512, kernel_size=(3, 3), activation='relu', padding='same'))
+cnn_model.add(BatchNormalization())
+cnn_model.add(Conv2D(512, kernel_size=(3, 3), activation='relu', padding='same'))
+cnn_model.add(BatchNormalization())
+cnn_model.add(MaxPooling2D(pool_size=(2, 2), strides=(2, 2)))
+cnn_model.add(Dropout(0.5))
+
+cnn_model.add(Flatten())
+
+cnn_model.add(Dense(512, activation='relu'))
+cnn_model.add(Dropout(0.4))
+cnn_model.add(Dense(256, activation='relu'))
+cnn_model.add(Dropout(0.4))
+cnn_model.add(Dense(128, activation='relu'))
+cnn_model.add(Dropout(0.5))
+cnn_model.add(Dense(n_labels, activation='softmax'))
+
+#Saves the Best Model Based on Val Loss
+checkpoint = ModelCheckpoint('best_cnn_model.h5', verbose=1, monitor='val_loss',save_best_only=True, mode='auto')  
+
+# compliling the model with adam optimizer and categorical crossentropy loss
+cnn_model.compile(loss=categorical_crossentropy, optimizer=Adam(lr=0.001, beta_1=0.9, beta_2=0.999), metrics=['accuracy'])
+
+# training the model
+cnn_history = cnn_model.fit(X_train_cnn, y_train, batch_size=batch_size, epochs=epochs, verbose=1, 
+                            callbacks=[checkpoint], validation_data=(X_test_cnn, y_test), shuffle=True)
+
+"""###Evaluate the model"""
+
+# YOUR CODE HERE
+
+#@title Instructor Solution
+cnn_performance = cnn_model.evaluate(X_test_cnn, y_test, batch_size=64)
+
+"""###Plot Accuracy and Loss"""
+
+# YOUR CODE HERE
+
+#@title Instructor Solution
+plot_graphs(cnn_history, cnn_performance)
+
+"""## Instructor-Led Discussion
+
+How does this model compare with the others? Did this perform as well as we wanted it to? What might be some of the reasons why?
+
+#Transfer Learning
+"""
+
+#@title Run this to build your transfer learning model { display-mode: "form" }
+
+import keras
+from keras.models import Sequential
+from keras.layers import Activation, MaxPooling2D, Dropout, Flatten, Reshape, Dense, Conv2D, GlobalAveragePooling2D
+from keras.wrappers.scikit_learn import KerasClassifier
+from keras.applications.vgg16 import VGG16
+
+# load the vgg network that is an 'expert' at 'imagenet' but do not include the FC layers
+vgg_expert = VGG16(weights = 'imagenet', include_top = False, input_shape = (48, 48, 3))
+
+# we add the first 12 layers of vgg to our own model vgg_model
+vgg_model = Sequential()
+vgg_model.add(vgg_expert)
+
+# and then add our own layers on top of it
+vgg_model.add(GlobalAveragePooling2D())
+vgg_model.add(Dense(1024, activation = 'relu'))
+vgg_model.add(Dropout(0.3))
+vgg_model.add(Dense(512, activation = 'relu'))
+vgg_model.add(Dropout(0.3))
+vgg_model.add(Dense(5, activation = 'sigmoid'))
+
+# finally, we build the vgg model and turn it on so we can use it!
+vgg_model.compile(loss = 'categorical_crossentropy', 
+          optimizer = SGD(lr=1e-4, momentum=0.95), 
+          metrics=['accuracy'])
+
+X_TRAIN = np.array([np.transpose(np.array([X_train_cnn[ix].squeeze() for i in range(3)]), (1,2,0)) for ix in range(len(X_train))])
+X_TEST = np.array([np.transpose(np.array([X_test_cnn[ix].squeeze() for i in range(3)]), (1,2,0)) for ix in range(len(X_test))])
+
+#training the model
+vgg_history = vgg_model.fit(X_TRAIN, y_train,
+          batch_size=batch_size,
+          epochs=epochs,
+          verbose=1,
+          callbacks=[checkpoint],
+          validation_data=(X_TEST, y_test),
+          shuffle=True)
+
+"""###Evaluate model"""
+
+#@title Instructor Solution
+vgg_performance = vgg_model.evaluate(X_TEST, y_test, batch_size=64)
+
+"""###Visualize accuracy and loss over training + display best model's performance"""
+
+# YOUR CODE HERE
+
+#@title Instructor Solution
+plot_graphs(vgg_history, vgg_performance)
+
+compare_learning(mlp_history, lm_history, cnn_history, vgg_history)
+
+"""## Optional Instructor Appendix: Code to determine some reference accuracy scores"""
+
+from sklearn.neighbors import KNeighborsClassifier
+
+# pixel-based knn classification accuracy... this will take a few minutes 
+knn_pixel = KNeighborsClassifier(n_neighbors=3)
+knn_pixel.fit(X_train, y_train)
+knn_predictions_pixel = knn_pixel.predict(X_test)
+knn_accuracy_pixel = np.mean(knn_predictions_pixel.argmax(1) == y_test.argmax(1))
+
+# landmark-based knn classification accuracy... this will take a few minutes 
+knn_lm = KNeighborsClassifier(n_neighbors=3)
+knn_lm.fit(X_train_lm, y_train_lm)
+knn_predictions_lm = knn_lm.predict(X_test_lm)
+knn_accuracy_lm = np.mean( knn_predictions_lm.argmax(1) == y_test_lm.argmax(1))
+
+# chance accuracy
+chance_accuracy = 1/n_labels
+
+# human accuracy
+human_accuracy = .65
+
+def compare_learning(mlp, lm, cnn, vgg, benchmarks): 
+
+  plt.figure(figsize=[7, 5])  
+
+  # summarize history for accuracy
+
+  plt.xticks(range(4, epochs+1,5), range(5, epochs+1,5) )
+  
+  plt.title('Performance of multiple models across training', y=1.05, fontsize=15)
+
+  plt.ylim([.15, .72])
+
+  plt.plot(lm.history['val_accuracy'], linestyle='-', color='purple', )
+  plt.plot(mlp.history['val_accuracy'], linestyle='--', color='purple')
+
+  plt.plot(vgg.history['val_accuracy'],color='blue', linestyle='-', linewidth=2)
+  plt.plot(cnn.history['val_accuracy'],color='red', linestyle='-', linewidth=2)
+  
+  plt.ylabel('Accuracy', fontsize=15)
+  plt.xlabel('Training Epoch', fontsize=15)
+
+
+  plt.legend(['MLP''$_{landmarks}$', 'MLP''$_{pixels}$', 'CNN''$_{pretrained}$', 'CNN''$_{from.scratch}$'],
+             framealpha=0, title_fontsize=9,loc=8)
+
+  plt.xticks(range(4, epochs+1,5), range(5, epochs+1,5) )
+  plt.ylim([.11, .72])
+
+  for i_benchmark in benchmarks: 
+    plt.scatter(x=epochs, y=references[i_benchmark], color='black', marker='_', s=200) 
+    plt.annotate('%s: %d%%'%( i_benchmark, references[i_benchmark] *100), xy=(epochs+1, references[i_benchmark]-.005), size=10, color='black', ha='left') 
+  plt.annotate('Important References', xy=(epochs+.5, .69), size=10, color='black', ha='left', fontweight='bold') 
+
+  plt.ylim([.11, .72])
+  plt.gca().spines['right'].set_color('none')
+  plt.gca().spines['top'].set_color('none')
+
+  plt.show()
+
+references = {'$KNN_{pixel}$ Accuracy': knn_accuracy_pixel, '$KNN_{landmark}$ Accuracy': knn_accuracy_lm, 'Human Accuracy': human_accuracy, 'chance': chance_accuracy}
+
+compare_learning(mlp_history, lm_history, cnn_history, vgg_history, references)
